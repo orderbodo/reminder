@@ -6,9 +6,15 @@ import httpx
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 
-from database import SessionLocal, Task
+from database import SessionLocal, Task, Base, engine
 
 load_dotenv()
+
+# Automatically create tables if they don't exist in Supabase
+try:
+    Base.metadata.create_all(bind=engine)
+except Exception as e:
+    print(f"Warning: could not auto-create tables: {e}")
 
 app = FastAPI(title="Telegram Persistent Reminder Bot")
 
@@ -137,35 +143,38 @@ async def cron_nag(secret: str, db: Session = Depends(get_db)):
     if secret != CRON_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
 
-    now = datetime.now(timezone.utc)
+    try:
+        now = datetime.now(timezone.utc)
 
-    # Find pending tasks whose snooze time has passed (or was never set)
-    tasks = db.query(Task).filter(
-        Task.status == "pending",
-        (Task.snooze_until == None) | (Task.snooze_until <= now)
-    ).all()
+        # Find pending tasks whose snooze time has passed (or was never set)
+        tasks = db.query(Task).filter(
+            Task.status == "pending",
+            (Task.snooze_until == None) | (Task.snooze_until <= now)
+        ).all()
 
-    for task in tasks:
-        task.remind_count += 1
-        task.last_reminded_at = now
-        # Auto-snooze for 1 hour so it doesn't repeatedly ping every 15-minute cron execution
-        task.snooze_until = now + timedelta(hours=1)
-        db.commit()
+        for task in tasks:
+            task.remind_count += 1
+            task.last_reminded_at = now
+            task.snooze_until = now + timedelta(hours=1)
+            db.commit()
 
-        markup = {
-            "inline_keyboard": [
-                [{"text": "✅ Done", "callback_data": f"done_{task.id}"}],
-                [
-                    {"text": "⏰ 30m", "callback_data": f"snooze_{task.id}_30"},
-                    {"text": "⏰ 2h", "callback_data": f"snooze_{task.id}_120"}
+            markup = {
+                "inline_keyboard": [
+                    [{"text": "✅ Done", "callback_data": f"done_{task.id}"}],
+                    [
+                        {"text": "⏰ 30m", "callback_data": f"snooze_{task.id}_30"},
+                        {"text": "⏰ 2h", "callback_data": f"snooze_{task.id}_120"}
+                    ]
                 ]
-            ]
-        }
+            }
 
-        await send_telegram_message(
-            chat_id=task.user_id,
-            text=f"🔔 *Reminder (Ping #{task.remind_count})*\nHave you finished: *\"{task.task_text}\"*?",
-            reply_markup=markup
-        )
+            await send_telegram_message(
+                chat_id=task.user_id,
+                text=f"🔔 *Reminder (Ping #{task.remind_count})*\nHave you finished: *\"{task.task_text}\"*?",
+                reply_markup=markup
+            )
 
-    return {"status": "reminded", "count": len(tasks)}
+        return {"status": "reminded", "count": len(tasks)}
+    except Exception as e:
+        print(f"Error in cron_nag: {e}")
+        raise HTTPException(status_code=500, detail=f"Database or execution error: {str(e)}")
