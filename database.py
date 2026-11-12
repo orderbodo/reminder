@@ -35,3 +35,18 @@ class Task(Base):
     last_reminded_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     completed_at = Column(DateTime(timezone=True), nullable=True)
+
+class DigestLog(Base):
+    __tablename__ = "digest_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(BigInteger, nullable=False, index=True)
+    slot_key = Column(String, nullable=False, index=True)  # e.g., "2026-11-12_09:30"
+    sent_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+class UserSetting(Base):
+    __tablename__ = "user_settings"
+
+    user_id = Column(BigInteger, primary_key=True, index=True)
+    paused_until = Column(DateTime(timezone=True), nullable=True)
+
