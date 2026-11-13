@@ -5,11 +5,16 @@ CREATE TABLE IF NOT EXISTS tasks (
     task_text TEXT NOT NULL,
     status VARCHAR(20) DEFAULT 'pending', -- 'pending', 'completed', 'cancelled'
     snooze_until TIMESTAMPTZ NULL,
+    end_time TIMESTAMPTZ NULL,
+    interval_mins INT DEFAULT 60,
     remind_count INT DEFAULT 0,
     last_reminded_at TIMESTAMPTZ NULL,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     completed_at TIMESTAMPTZ NULL
 );
+
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS interval_mins INT DEFAULT 60;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS end_time TIMESTAMPTZ NULL;
 
 CREATE INDEX IF NOT EXISTS idx_tasks_pending ON tasks (user_id, status, snooze_until);
 

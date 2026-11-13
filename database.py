@@ -31,6 +31,8 @@ class Task(Base):
     task_text = Column(String, nullable=False)
     status = Column(String, default="pending")  # 'pending', 'completed', 'cancelled'
     snooze_until = Column(DateTime(timezone=True), nullable=True)
+    end_time = Column(DateTime(timezone=True), nullable=True)  # Optional end window (e.g. 15h)
+    interval_mins = Column(Integer, default=60)  # Custom repeat interval in minutes (default 60m = 1h)
     remind_count = Column(Integer, default=0)
     last_reminded_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
