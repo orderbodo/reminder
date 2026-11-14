@@ -10,6 +10,11 @@ from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 
 from database import SessionLocal, Task, DigestLog, UserSetting, Base, engine
+import ai_parser
+
+# Optional: comma-separated Telegram user IDs allowed to use the AI (protects your API quota).
+# Leave empty to allow everyone.
+ALLOWED_USER_IDS = {int(x) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x.strip().isdigit()}
 
 load_dotenv()
 
@@ -250,6 +255,122 @@ def match_task_keyword(kw: str, task_text: str) -> bool:
 def health():
     return {"status": "ok", "message": "Telegram Reminder Bot is running!"}
 
+# ----------------- AI ACTION EXECUTOR -----------------
+def _clean(s: str) -> str:
+    """Strip Markdown control chars so AI-written text can't break Telegram formatting."""
+    return re.sub(r"[*_`\[\]]", "", str(s or "")).strip()
+
+def _parse_iso(value, fallback_tz=TZ) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=fallback_tz)
+        return dt
+    except Exception:
+        return None
+
+def apply_ai_actions(db: Session, chat_id: int, actions: List[dict]) -> List[str]:
+    """Executes AI-decided actions against the DB. Returns reply lines for Telegram."""
+    replies: List[str] = []
+    now_utc = datetime.now(timezone.utc)
+
+    for act in actions:
+        kind = act.get("type")
+
+        if kind == "add_task":
+            name = _clean(act.get("task"))
+            if not name:
+                continue
+            start = _parse_iso(act.get("start_iso"))
+            end = _parse_iso(act.get("end_iso"))
+            interval = act.get("interval_mins")
+            interval = int(interval) if isinstance(interval, (int, float)) and interval > 0 else 60
+
+            task = Task(
+                user_id=chat_id,
+                task_text=name,
+                snooze_until=start.astimezone(timezone.utc) if start and start > datetime.now(TZ) else None,
+                end_time=end.astimezone(timezone.utc) if end else None,
+                interval_mins=interval,
+            )
+            db.add(task)
+            db.commit()
+
+            line = f"📝 *Added:* {name}"
+            if start and start > datetime.now(TZ):
+                line += f"\n   ⏰ starts {start.astimezone(TZ).strftime('%a %H:%M')}"
+            if end:
+                line += f"\n   🏁 until {end.astimezone(TZ).strftime('%a %H:%M')}"
+            line += f"\n   🔄 every {format_interval_label(interval)}"
+            replies.append(line)
+
+        elif kind in ("done", "delete", "snooze", "set_interval"):
+            task = db.query(Task).filter(
+                Task.id == act.get("task_id"), Task.user_id == chat_id, Task.status == "pending"
+            ).first()
+            if not task:
+                replies.append("⚠️ I couldn't find that task. Type /list to see your tasks.")
+                continue
+
+            if kind == "done":
+                task.status, task.completed_at = "completed", now_utc
+                replies.append(f"✅ *Done:* {_clean(task.task_text)} 🎉")
+            elif kind == "delete":
+                task.status = "cancelled"
+                replies.append(f"🗑 *Deleted:* {_clean(task.task_text)}")
+            elif kind == "snooze":
+                until = _parse_iso(act.get("until_iso"))
+                if not until:
+                    replies.append("⚠️ I didn't catch the snooze time.")
+                    continue
+                task.snooze_until = until.astimezone(timezone.utc)
+                replies.append(f"⏳ *Snoozed:* {_clean(task.task_text)} until {until.astimezone(TZ).strftime('%a %H:%M')}")
+            elif kind == "set_interval":
+                mins = int(act.get("interval_mins") or 60)
+                task.interval_mins = mins
+                replies.append(f"🔄 *{_clean(task.task_text)}* will now nag every {format_interval_label(mins)}")
+            db.commit()
+
+        elif kind == "pause_all":
+            until = _parse_iso(act.get("until_iso"))
+            if not until:
+                replies.append("⚠️ I didn't catch how long to pause.")
+                continue
+            setting = db.query(UserSetting).filter(UserSetting.user_id == chat_id).first()
+            if not setting:
+                setting = UserSetting(user_id=chat_id)
+                db.add(setting)
+            setting.paused_until = until.astimezone(timezone.utc)
+            db.commit()
+            replies.append(f"⏸ *All reminders paused* until {until.astimezone(TZ).strftime('%a %H:%M')}")
+
+        elif kind == "resume_all":
+            setting = db.query(UserSetting).filter(UserSetting.user_id == chat_id).first()
+            if setting:
+                setting.paused_until = None
+                db.commit()
+            replies.append("▶️ *Reminders resumed!*")
+
+        elif kind == "list":
+            tasks = db.query(Task).filter(Task.user_id == chat_id, Task.status == "pending").order_by(Task.id.asc()).all()
+            if not tasks:
+                replies.append("🎉 No pending tasks!")
+            else:
+                lines = ["📋 *Pending tasks:*"]
+                for i, t in enumerate(tasks, 1):
+                    note = ""
+                    if t.snooze_until and t.snooze_until > now_utc:
+                        note = f" _(quiet until {t.snooze_until.astimezone(TZ).strftime('%a %H:%M')})_"
+                    lines.append(f"{i}. {_clean(t.task_text)}{note}")
+                replies.append("\n".join(lines))
+
+        elif kind == "chat":
+            replies.append(_clean(act.get("reply")) or "🤔 Could you rephrase that?")
+
+    return replies
+
 # ----------------- TELEGRAM WEBHOOK -----------------
 @app.post("/webhook")
 async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
@@ -366,6 +487,21 @@ async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
                 db.commit()
             await send_telegram_message(chat_id, "▶️ *Reminders resumed!* Back on duty.")
             return {"ok": True}
+
+        # ----------------- AI BRAIN (understands free-form EN / VI) -----------------
+        # Slash commands (/list, /pause...) stay rule-based. Everything else goes to the AI.
+        # If the AI is unavailable or fails, we silently fall through to the rule-based parser below.
+        ai_allowed = not ALLOWED_USER_IDS or chat_id in ALLOWED_USER_IDS
+        if ai_allowed and ai_parser.GEMINI_API_KEY and not text_content.startswith("/"):
+            pending = db.query(Task).filter(Task.user_id == chat_id, Task.status == "pending").order_by(Task.id.asc()).all()
+            ai_actions = await ai_parser.interpret(
+                text_content, now_local, [{"id": t.id, "text": t.task_text} for t in pending]
+            )
+            if ai_actions:
+                replies = apply_ai_actions(db, chat_id, ai_actions)
+                if replies:
+                    await send_telegram_message(chat_id, "\n\n".join(replies))
+                    return {"ok": True}
 
         # ----------------- DONE BY NAME OR NUMBER (Bilingual) -----------------
         # E.g. 'done slides', 'xong slide', 'done 1', 'completed report'
