@@ -1,65 +1,72 @@
-"""
-AI layer: turns any free-form message (English / Vietnamese / mixed) into structured actions.
-Uses the Gemini REST API via httpx (no extra dependency).
-If the key is missing or the call fails, main.py falls back to the rule-based parser.
-"""
-import json
 import os
+import json
 from datetime import datetime
 from typing import List, Optional
-
 import httpx
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
-SYSTEM_PROMPT = """You are the brain of a Telegram to-do reminder bot. The user writes in English, Vietnamese, or a mix.
-Convert the user's message into a JSON object: {"actions": [ ... ]}. One message may contain several actions.
+SYSTEM_PROMPT = """You are the AI brain of a Telegram persistent reminder bot.
+The user talks naturally in English, Vietnamese, or mixed.
+Your job is to understand their intent and convert it into a JSON object: {"actions": [ ... ]}
 
-Action types (use exactly these keys):
-1. {"type":"add_task","task":"short clean task name","start_iso":null|"ISO8601","end_iso":null|"ISO8601","interval_mins":null|int}
-   - start_iso: when reminders should START (null = remind immediately).
-   - end_iso: when reminders should STOP (null = until done).
-   - interval_mins: how often to nag (null = 60).
-2. {"type":"done","task_id":int}            - user finished a task
-3. {"type":"delete","task_id":int}          - user wants to cancel/remove a task
-4. {"type":"snooze","task_id":int,"until_iso":"ISO8601"}  - delay ONE task
-5. {"type":"set_interval","task_id":int,"interval_mins":int} - change how often a task nags
-6. {"type":"list"}                          - show pending tasks
-7. {"type":"pause_all","until_iso":"ISO8601"} - silence ALL reminders
-8. {"type":"resume_all"}                    - turn reminders back on
-9. {"type":"chat","reply":"short helpful reply"} - anything else / unclear / needs clarification
+Action types you can emit:
+1. {"type":"add_task","task":"Clean task name","start_iso":null|"ISO8601","end_iso":null|"ISO8601","interval_mins":int}
+   - start_iso: when reminders should start (null = remind immediately).
+   - end_iso: deadline/end window when reminders should stop (null = none).
+   - interval_mins: repeat/nag interval in minutes (default 60 if not specified).
+2. {"type":"done","task_id":int}            -> user completed a task.
+3. {"type":"delete","task_id":int}          -> user wants to remove/cancel a task.
+4. {"type":"snooze","task_id":int,"until_iso":"ISO8601"} -> delay/snooze a specific task.
+5. {"type":"pause_all","until_iso":"ISO8601"} -> silence all reminders until a specific time.
+6. {"type":"resume_all"}                    -> unpause/resume all reminders now.
+7. {"type":"list"}                          -> user asks to see their tasks.
+8. {"type":"chat","reply":"friendly brief response"} -> greetings, general chat, or asking clarification.
 
 Rules:
-- Use the pending task list (with ids) to pick task_id. Match by meaning, not exact words
-  (e.g. "xong slide rồi" -> the slide task). If nothing matches, use "chat" and say so.
-- All times are in the user's timezone. Use the provided current local time to resolve
-  "tonight", "tomorrow", "in 2 hours", "chiều nay", "mai 9h", "từ 11h đến 15h", etc.
-  Output ISO8601 WITH the UTC offset given in the current time.
-- If a time of day already passed today, assume the next occurrence.
-- "every 30 minutes" / "mỗi 30p" -> interval_mins=30. "mỗi tiếng" -> 60.
-- Keep "task" short, in the user's own language, without time words.
-- Reply in the same language as the user for "chat" replies. Keep replies under 2 sentences.
-- Output ONLY valid JSON. No markdown fences, no commentary.
+- Match task_id using the pending tasks list by meaning (e.g. "done slide" matches task "Finish quarterly slide deck").
+- All times must be resolved to ISO8601 with the local timezone offset provided in the context.
+- "every 30m" / "mỗi 30p" -> interval_mins = 30. Default is 60.
+- If a time has already passed today, assume tomorrow or the upcoming occurrence.
+- Keep task names clean (strip out time words like "at 5pm" or "từ 11h").
+- Return strictly valid JSON.
 """
 
+async def diagnose() -> str:
+    """Tests the Gemini API connection live."""
+    if not GEMINI_API_KEY:
+        return "❌ GEMINI_API_KEY is not set in Render Environment variables."
+    payload = {"contents": [{"role": "user", "parts": [{"text": "Reply with: OK"}]}]}
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(GEMINI_URL, params={"key": GEMINI_API_KEY}, json=payload)
+        if resp.status_code == 200:
+            return f"✅ AI is working perfectly!\nModel: {GEMINI_MODEL}"
+        try:
+            err = resp.json().get("error", {}).get("message", resp.text)
+        except Exception:
+            err = resp.text
+        return f"❌ Gemini Error (HTTP {resp.status_code}): {err[:300]}"
+    except Exception as e:
+        return f"❌ Could not connect to Gemini: {e}"
 
 async def interpret(text: str, now_local: datetime, pending_tasks: List[dict]) -> Optional[List[dict]]:
-    """Returns a list of action dicts, or None if the AI is unavailable / failed."""
+    """Sends user text + context to Gemini and returns structured actions."""
     if not GEMINI_API_KEY:
         return None
 
-    task_lines = "\n".join(f'{t["id"]}: {t["text"]}' for t in pending_tasks) or "(none)"
-    user_block = (
+    tasks_context = "\n".join(f"- ID {t['id']}: {t['text']}" for t in pending_tasks) or "(None)"
+    user_context = (
         f"Current local time: {now_local.isoformat(timespec='minutes')} ({now_local.strftime('%A')})\n"
-        f"Pending tasks:\n{task_lines}\n\n"
+        f"Pending tasks for this user:\n{tasks_context}\n\n"
         f"User message: {text}"
     )
 
     payload = {
         "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents": [{"role": "user", "parts": [{"text": user_block}]}],
+        "contents": [{"role": "user", "parts": [{"text": user_context}]}],
         "generationConfig": {
             "temperature": 0.1,
             "responseMimeType": "application/json",
@@ -75,5 +82,5 @@ async def interpret(text: str, now_local: datetime, pending_tasks: List[dict]) -
             actions = data.get("actions", [])
             return actions if isinstance(actions, list) else None
     except Exception as e:
-        print(f"AI interpret failed, falling back to rules: {e}")
+        print(f"Gemini interpret error: {e}")
         return None

@@ -15,11 +15,11 @@ elif DATABASE_URL.startswith("postgres://"):
 elif DATABASE_URL.startswith("postgresql://") and not DATABASE_URL.startswith("postgresql+"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
-# SQLite doesn't support pool_pre_ping the same way, handle both
 if DATABASE_URL.startswith("sqlite"):
     engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 else:
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -31,8 +31,8 @@ class Task(Base):
     task_text = Column(String, nullable=False)
     status = Column(String, default="pending")  # 'pending', 'completed', 'cancelled'
     snooze_until = Column(DateTime(timezone=True), nullable=True)
-    end_time = Column(DateTime(timezone=True), nullable=True)  # Optional end window (e.g. 15h)
-    interval_mins = Column(Integer, default=60)  # Custom repeat interval in minutes (default 60m = 1h)
+    end_time = Column(DateTime(timezone=True), nullable=True)
+    interval_mins = Column(Integer, default=60)
     remind_count = Column(Integer, default=0)
     last_reminded_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
@@ -43,7 +43,7 @@ class DigestLog(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(BigInteger, nullable=False, index=True)
-    slot_key = Column(String, nullable=False, index=True)  # e.g., "2026-11-12_09:30"
+    slot_key = Column(String, nullable=False, index=True)  # e.g., "2026-11-19_09:30"
     sent_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 class UserSetting(Base):
@@ -51,4 +51,3 @@ class UserSetting(Base):
 
     user_id = Column(BigInteger, primary_key=True, index=True)
     paused_until = Column(DateTime(timezone=True), nullable=True)
-
