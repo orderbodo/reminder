@@ -60,12 +60,32 @@ def get_db():
     finally:
         db.close()
 
-async def send_telegram_message(chat_id: int, message_text: str, reply_markup: Optional[dict] = None):
-    async with httpx.AsyncClient() as client:
-        payload = {"chat_id": chat_id, "text": message_text, "parse_mode": "Markdown"}
-        if reply_markup:
-            payload["reply_markup"] = reply_markup
-        await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
+LAST_TELEGRAM_ERROR: Optional[str] = None
+
+async def send_telegram_message(chat_id: int, message_text: str, reply_markup: Optional[dict] = None) -> bool:
+    """Sends a message. Returns True on success. Retries as plain text if Markdown formatting is rejected."""
+    global LAST_TELEGRAM_ERROR
+    payload = {"chat_id": chat_id, "text": message_text, "parse_mode": "Markdown"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
+            if resp.status_code == 200:
+                return True
+            LAST_TELEGRAM_ERROR = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            print(f"Telegram send failed ({LAST_TELEGRAM_ERROR}); retrying as plain text")
+            payload.pop("parse_mode", None)
+            resp = await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
+            if resp.status_code == 200:
+                return True
+            LAST_TELEGRAM_ERROR = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            print(f"Telegram plain-text retry failed: {LAST_TELEGRAM_ERROR}")
+            return False
+    except Exception as e:
+        LAST_TELEGRAM_ERROR = f"{type(e).__name__}: {e}"
+        print(f"Telegram send exception: {LAST_TELEGRAM_ERROR}")
+        return False
 
 async def answer_callback_query(callback_query_id: str, feedback: str):
     async with httpx.AsyncClient() as client:
@@ -446,6 +466,7 @@ async def cron_nag(secret: str, db: Session = Depends(get_db)):
     ).all()
 
     nagged_count = 0
+    failed_count = 0
     for task in tasks_to_nag:
         user_setting = db.query(UserSetting).filter(UserSetting.user_id == task.user_id).first()
         if user_setting and user_setting.paused_until and user_setting.paused_until > now_utc:
@@ -454,29 +475,34 @@ async def cron_nag(secret: str, db: Session = Depends(get_db)):
         if task.end_time and now_utc > task.end_time:
             continue
 
-        task.remind_count += 1
-        task.last_reminded_at = now_utc
-
-        # Auto-snooze for 1 hour by default if ignored
-        task.snooze_until = now_utc + timedelta(hours=1)
-        db.commit()
-
         interval = task.interval_mins or 60
         lbl = format_interval_label(interval)
         markup = make_task_markup(task.id, interval)
-        await send_telegram_message(
-            chat_id=task.user_id,
-            text=(
-                f"🔔 *Reminder (Ping #{task.remind_count})*\n"
-                f"Have you finished: *\"{task.task_text}\"*?\n\n"
-                f"_(Auto-snoozes for 1h if no reply in 2 mins. Tap Snooze for {lbl}, or reply to customize)_"
+        sent = await send_telegram_message(
+            task.user_id,
+            (
+                f"🔔 *Reminder (Ping #{task.remind_count + 1})*\n"
+                f"Have you finished: *\"{clean_text(task.task_text)}\"*?\n\n"
+                f"Auto-snoozes for 1h if no reply. Tap Snooze for {lbl}, or tell me a custom time."
             ),
             reply_markup=markup
         )
-        nagged_count += 1
+
+        # Only advance the schedule if the reminder really reached the user.
+        if sent:
+            task.remind_count += 1
+            task.last_reminded_at = now_utc
+            # Auto-snooze for 1 hour by default if ignored
+            task.snooze_until = now_utc + timedelta(hours=1)
+            db.commit()
+            nagged_count += 1
+        else:
+            failed_count += 1
 
     return {
         "status": "success",
         "digest_slot": digest_slot,
-        "nagged_tasks": nagged_count
+        "nagged_tasks": nagged_count,
+        "failed_sends": failed_count,
+        "last_telegram_error": LAST_TELEGRAM_ERROR
     }
